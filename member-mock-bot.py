@@ -364,6 +364,27 @@ async def order_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="best", description="Show top 10 undrafted players")
+@app_commands.describe(position="Filter by position (optional)")
+@app_commands.choices(position=[
+    # Set position id to match values in this sheet
+    app_commands.Choice(name="QB", value="1"),
+    app_commands.Choice(name="RB", value="2"),
+    app_commands.Choice(name="WR", value="3"),
+    app_commands.Choice(name="TE", value="4"),
+    app_commands.Choice(name="OL", value="5"),
+    app_commands.Choice(name="OT", value="6"),
+    app_commands.Choice(name="OG", value="7"),
+    app_commands.Choice(name="C", value="8"),
+    app_commands.Choice(name="DL", value="9"),
+    app_commands.Choice(name="DE", value="10"),
+    app_commands.Choice(name="DT", value="11"),
+    app_commands.Choice(name="EDGE", value="12"),
+    app_commands.Choice(name="LB", value="13"),
+    app_commands.Choice(name="CB", value="14"),
+    app_commands.Choice(name="S", value="15"),
+    app_commands.Choice(name="K", value="16"),
+    app_commands.Choice(name="P", value="17")
+])
 async def best_command(interaction: discord.Interaction):
     undrafted = [p for p in draft_state["prospects"].values() if not p['drafted']]
     top_10 = sorted(undrafted, key=lambda x: x['ranking'])[:10]
