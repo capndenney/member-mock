@@ -2,91 +2,38 @@ import os
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import json
 import gspread
+from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 import pytz
-import asyncio
+from dotenv import load_dotenv
 from typing import Optional, List, Dict
 
 # --- INITIALIZATION ---
+load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Configuration
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
-SHEET_ID = "YOUR_SHEET_ID_HERE"
-ADMIN_USERS = [123456789] 
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+ADMIN_IDS = json.loads(os.getenv("ADMIN_USERS", "[]"))
+ALLOWED_CHANNELS = json.loads(os.getenv("ALLOWED_CHANNELS", "[]"))
+REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", 0))
+PICK_CHANNEL_ID = int(os.getenv("PICK_CHANNEL_ID", 0))
 CENTRAL_TZ = pytz.timezone('America/Chicago')
 PICK_TIME_HOURS = 2
-
-# Global state
-draft_state = {
-    "running": False,
-    "timer_paused": False,
-    "current_pick_index": 0,
-    "trade_in_progress": False,
-    "picks": [],
-    "teams": {},
-    "users": {},
-    "prospects": {},
-    "positions": {},
-    "warning_sent": None
-}
-
-@tasks.loop(minutes=5)
-async def draft_timer_check():
-    if not draft_state.get("running") or draft_state.get("timer_paused"):
-        return
-
-    current_pick = get_current_pick()
-    if not current_pick:
-        return
-
-    # Check if we've already warned for THIS specific pick ID
-    if draft_state["warning_sent"] == current_pick['id']:
-        return
-
-    time_remaining = get_time_remaining()
-    channel_id = int(os.getenv("CHANNEL_ID", 0))
-
-    # If 30 minutes or less (but more than 0)
-    if timedelta(minutes=0) < time_remaining <= timedelta(minutes=30):
-        current_team = draft_state["teams"].get(current_pick['team_id'])
-        gm_user_info = draft_state["users"].get(current_team['gm_id'])
-        
-        if gm_user_info:
-            # We assume your 'username' in the sheet is the Discord User ID (int) 
-            # or a string we can fetch. Adjust fetch_user as needed.
-            try:
-                # Find the main draft channel (Replace with your Channel ID)
-                channel = bot.get_channel(channel_id) 
-                
-                mention = f"<@{gm_user_info['username']}>"
-                await channel.send(
-                    f"⚠️ {mention} — **{current_team['team_short']}** has less than **30 minutes** remaining on the clock!"
-                )
-                
-                # Mark as sent for this pick ID
-                draft_state["warning_sent"] = current_pick['id']
-            except Exception as e:
-                print(f"Error in timer loop: {e}")
-
-# IMPORTANT: You must start the loop in on_ready
-@bot.event
-async def on_ready():
-    await load_data()
-    await bot.tree.sync()
-    if not draft_timer_check.is_running():
-        draft_timer_check.start()
-    print(f"{bot.user} is online and the timer loop is active!")
 
 # --- DATA MANAGEMENT ---
 
 class GoogleSheetsManager:
     def __init__(self, credentials_file: str, sheet_id: str):
-        scope = ["https://spreadsheets.google.com/auth/spreadsheets"]
+        scope = ["https://www.googleapis.com/auth/spreadsheets",
+                 "https://www.googleapis.com/auth/drive.file",
+                 "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(credentials_file, scopes=scope)
         self.client = gspread.authorize(creds)
         self.sheet = self.client.open_by_key(sheet_id)
@@ -114,7 +61,8 @@ class GoogleSheetsManager:
             users[row['id']] = {
                 'username': row['username'],
                 'screen_name': row['screen_name'],
-                'timezone': row['timezone']
+                'timezone': row['timezone'],
+                'team_pick_order': row['team_pick_order']
             }
         return users
     
@@ -139,10 +87,10 @@ class GoogleSheetsManager:
             picks.append({
                 'id': row['id'],
                 'team_id': row['team_id'],
-                'player_id': row.get('player_id'),
                 'otc_at': row.get('otc_at'),
-                'clock_expire': row.get('clock_expire') == 'TRUE',
-                'picked_at': row.get('picked_at')
+                'player_id': row.get('player_id'),
+                'picked_at': row.get('picked_at'),
+                'clock_expire': row.get('clock_expire') == 'TRUE'
             })
         return sorted(picks, key=lambda x: x['id'])
     
@@ -153,78 +101,178 @@ class GoogleSheetsManager:
             positions[row['id']] = row['position']
         return positions
     
-    def update_prospect_drafted(self, prospect_id: int):
+    def update_prospect_drafted(self, prospect_id: int, status: bool = True):
         ws = self.get_worksheet("prospects")
         cell = ws.find(str(prospect_id), in_column=1)
-        ws.update_cell(cell.row, 6, "TRUE")
+        ws.update_cell(cell.row, 7, "TRUE" if status else "FALSE")
     
     def update_pick(self, pick_id: int, player_id: int, picked_at: str):
         ws = self.get_worksheet("picks")
         cell = ws.find(str(pick_id), in_column=1)
-        ws.update_cell(cell.row, 3, player_id)
+        ws.update_cell(cell.row, 4, player_id)
         ws.update_cell(cell.row, 5, picked_at)
+
+# Global Instance
+gs_manager = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
+
+# Global state
+draft_state = {
+    "running": False,
+    "timer_paused": False,
+    "current_pick_index": 0,
+    "trade_in_progress": False,
+    "picks": [],
+    "teams": {},
+    "users": {},
+    "prospects": {},
+    "positions": {},
+    "warning_sent": None,
+    "last_sync": "Never"
+}
+
+@tasks.loop(minutes=5)
+async def draft_timer_check():
+    if not draft_state.get("running") or draft_state.get("timer_paused"):
+        return
+
+    current_pick = get_current_pick()
+    if not current_pick:
+        return
+
+    # Check if we've already warned for THIS specific pick ID
+    if draft_state["warning_sent"] == current_pick['id']:
+        return
+
+    time_remaining = get_time_remaining()
+    channel_id = bot.get_channel(REMINDER_CHANNEL_ID)
+
+    # If 30 minutes or less (but more than 0)
+    if timedelta(minutes=0) < time_remaining <= timedelta(minutes=30):
+        current_team = draft_state["teams"].get(current_pick['team_id'])
+        gm_user_info = draft_state["users"].get(current_team['gm_id'])
+        
+        if channel_id and gm_user_info:
+            # We assume your 'username' in the sheet is the Discord User ID (int) 
+            # or a string we can fetch. Adjust fetch_user as needed.
+            try:
+                # Find the main draft channel (Replace with your Channel ID)
+                
+                mention = f"<@{gm_user_info['username']}>"
+                await channel_id.send(
+                    f"⚠️ {mention} — **{current_team['team_short']}** has less than **30 minutes** remaining on the clock!"
+                )
+                
+                # Mark as sent for this pick ID
+                draft_state["warning_sent"] = current_pick['id']
+            except Exception as e:
+                print(f"Error in timer loop: {e}")
+
+# IMPORTANT: You must start the loop in on_ready
+@bot.event
+async def on_ready():
+    await load_data()
+    await bot.tree.sync()
+    if not draft_timer_check.is_running():
+        draft_timer_check.start()
+    print(f"{bot.user} is online and the timer loop is active!")
 
 # --- LOGIC HELPERS ---
 
 async def load_data():
     try:
-        gs = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
-        draft_state["teams"] = gs.load_teams()
-        draft_state["users"] = gs.load_users()
-        draft_state["prospects"] = gs.load_prospects()
-        draft_state["picks"] = gs.load_picks()
-        draft_state["positions"] = gs.load_positions()
+        draft_state["teams"] = gs_manager.load_teams()
+        draft_state["users"] = gs_manager.load_users()
+        draft_state["prospects"] = gs_manager.load_prospects()
+        draft_state["picks"] = gs_manager.load_picks()
+        draft_state["positions"] = gs_manager.load_positions()
+        draft_state["last_sync"] = datetime.now(CENTRAL_TZ).strftime("%H:%M:%S")
     except Exception as e:
         print(f"Error loading data: {e}")
 
+def save_status():
+    # Saves the current running/paused state to a local file.
+    with open("draft_status.json", "w") as f:
+        data = {
+            "running": draft_state["running"],
+            "timer_paused": draft_state["timer_paused"]
+        }
+        json.dump(data, f)
+
+def load_status():
+    """Loads the state back into the draft_state dictionary on startup."""
+    try:
+        with open("draft_status.json", "r") as f:
+            data = json.load(f)
+            draft_state["running"] = data.get("running", False)
+            draft_state["timer_paused"] = data.get("timer_paused", False)
+    except FileNotFoundError:
+        # If the file doesn't exist yet, just keep the defaults
+        pass
+
 def find_prospect_by_name(first_name: str, last_name: str) -> Optional[int]:
     for pid, prospect in draft_state["prospects"].items():
-        if (prospect['f_name'].lower() == first_name.lower() and 
-            prospect['l_name'].lower() == last_name.lower()):
+        if (prospect['f_name'].strip().lower() == first_name.strip().lower() and 
+            prospect['l_name'].strip().lower() == last_name.strip().lower()):
             return pid
     return None
 
+def is_empty(value):
+    if value is None: return True
+    s_val = str(value).strip().lower()
+    return s_val in ["", "none", "0", "false", "null", 0, None]
+
 def get_current_pick() -> Optional[Dict]:
-    undrafted_picks = [p for p in draft_state["picks"] if p['player_id'] is None]
+    undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
     return undrafted_picks[0] if undrafted_picks else None
 
 def get_on_deck_and_in_hole() -> tuple:
-    undrafted_picks = [p for p in draft_state["picks"] if p['player_id'] is None]
+    undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
+    otc = undrafted_picks[0] if len(undrafted_picks) > 0 else None
     on_deck = undrafted_picks[1] if len(undrafted_picks) > 1 else None
     in_hole = undrafted_picks[2] if len(undrafted_picks) > 2 else None
-    return on_deck, in_hole
+    return otc, on_deck, in_hole
 
 def get_time_remaining() -> timedelta:
     now = datetime.now(CENTRAL_TZ)
     current_pick = get_current_pick()
-    if not current_pick or not current_pick['otc_at']:
+    if not current_pick or is_empty(current_pick.get('otc_at')):
         return timedelta(hours=PICK_TIME_HOURS)
 
     otc_time = datetime.fromisoformat(current_pick['otc_at']).astimezone(CENTRAL_TZ)
     
-    # 1. Handle Overnight Freeze: If it's currently between 10PM and 9AM
-    # We treat "now" as exactly 9:00 AM so the timer doesn't move.
-    effective_now = now
-    if now.hour >= 22:
-        effective_now = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-    elif now.hour < 9:
-        effective_now = now.replace(hour=9, minute=0, second=0, microsecond=0)
-
-    # 2. Calculate Deadline
-    # If the pick happened AFTER 10PM or BEFORE 9AM, its clock starts at 9AM.
-    effective_otc = otc_time
+# 1. Determine "Active" Start Time
+    # If pick was made during freeze (10PM-9AM), it effectively starts at 9AM
+    start_time = otc_time
     if otc_time.hour >= 22:
-        effective_otc = (otc_time + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        start_time = (otc_time + timedelta(days=1)).replace(hour=9, minute=0, second=0)
     elif otc_time.hour < 9:
-        effective_otc = otc_time.replace(hour=9, minute=0, second=0, microsecond=0)
+        start_time = otc_time.replace(hour=9, minute=0, second=0)
 
-    deadline = effective_otc + timedelta(hours=PICK_TIME_HOURS)
+    # 2. Calculate Raw Deadline
+    deadline = start_time + timedelta(hours=PICK_TIME_HOURS)
+
+    # 3. The "Overnight Jump"
+    # If the 2-hour window crosses the9PM barrier, push the deadline by 11 hours
+    # Example: Start 9:30 PM -> 2 hours later is 11:30 PM (crosses 10PM)
+    # We add 11 hours to jump from 10PM to 9AM.
+    if start_time.hour < 22 and deadline.hour >= 22 or (deadline.date() > start_time.date()):
+        deadline += timedelta(hours=11)
+
+# 4. Calculate Remaining Time
+    # If currently in the freeze (10PM-9AM), we compare the deadline 
+    # against the 9AM start time so the timer stays "paused."
+    is_in_freeze = now.hour >= 22 or now.hour < 9
     
-    remaining = deadline - effective_now
+    if is_in_freeze:
+        # The clock isn't running, so time remaining is fixed at its 9AM value
+        remaining = deadline - start_time
+    else:
+        # The clock is running, so use the actual current time
+        remaining = deadline - now
     return max(remaining, timedelta(0))
 
 async def notify_admins(interaction: discord.Interaction, message: str):
-    for admin_id in ADMIN_USERS:
+    for admin_id in ADMIN_IDS:
         try:
             user = await bot.fetch_user(admin_id)
             await user.send(message)
@@ -240,14 +288,23 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
     team_short_name = team_info.get('team_short', 'UNK')
     
     # Update Database
-    gs = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
-    now_iso = datetime.now(CENTRAL_TZ).isoformat()
-    gs.update_pick(current_pick['id'], prospect_id, now_iso)
-    gs.update_prospect_drafted(prospect_id)
     
-    # Update State
+    now_iso = datetime.now(CENTRAL_TZ).isoformat()
     current_pick['player_id'] = prospect_id
     prospect['drafted'] = True
+    current_pick['picked_at'] = now_iso
+    draft_state["warning_sent"] = None
+
+    gs_manager.update_pick(current_pick['id'], prospect_id, now_iso)
+    gs_manager.update_prospect_drafted(prospect_id)
+
+    otc, on_deck, in_hole = get_on_deck_and_in_hole()
+
+    if otc:
+        otc['otc_at'] = now_iso
+        ws = gs_manager.get_worksheet("picks")
+        next_pick_cell = ws.find(str(otc['id']), in_column=1)
+        ws.update_cell(next_pick_cell.row, 3, now_iso) # Update otc_at for the new pick
     
     # Create Response
     embed = discord.Embed(
@@ -258,31 +315,32 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
     embed.add_field(name="College", value=prospect['college'], inline=True)
     embed.add_field(name="Position", value=draft_state["positions"].get(prospect['position_id'], "N/A"), inline=True)
     embed.add_field(name="Ranking", value=prospect['ranking'], inline=True)
-
-    draft_state["warning_sent"] = None  # Reset any warnings on successful pick
     
-    on_deck, in_hole = get_on_deck_and_in_hole()
-    if on_deck:
-        next_team = draft_state["teams"][on_deck['team_id']]
-        next_gm = draft_state["users"].get(next_team['gm_id'])
+    if otc:
+        next_team = draft_state["teams"][otc['team_id']]
+        next_gm = draft_state["users"].get(next_team['gm_id']) if next_team else None
         if next_gm:
             message = f"🎙️ **On the Clock**: <@{next_gm.get('username', 'Unknown')}>\n"
-            if in_hole:
-                hole_team = draft_state["teams"][in_hole['team_id']]
-                hole_gm = draft_state["users"].get(hole_team['gm_id'])
-                if hole_gm:
-                    message += f"📍 **On Deck**: {draft_state['teams'][on_deck['team_id']].get('team_short')}\n"
-                    message += f"🕳️ **In the Hole**: {hole_gm.get('screen_name', 'Unknown')}"
+            if on_deck:
+                deck_team = draft_state["teams"][on_deck['team_id']]
+                deck_gm = draft_state["users"].get(deck_team['gm_id'])
+                if deck_gm:
+                    message += f"📍 **On Deck**: <@{deck_gm.get('username', 'Unknown')}> ({deck_team.get('team_short', 'UNK')})\n"
+                    if in_hole:
+                        hole_team = draft_state["teams"][in_hole['team_id']]
+                        hole_gm = draft_state["users"].get(hole_team['gm_id'])
+                        message += f"🕳️ **In the Hole**: <@{hole_gm.get('username', 'Unknown')}> ({hole_team.get('team_short', 'UNK')})\n"
             embed.add_field(name="Next", value=message, inline=False)
+    try: 
+        draft_state["picks"] = gs_manager.load_picks()  # Refresh picks to reflect changes
+        draft_state["prospects"] = gs_manager.load_prospects()  # Refresh prospects to reflect changes
+        print("Data refreshed after pick." )
+    except Exception as e:
+        print(f"Error refreshing data after pick: {e}") 
+
     return embed
 
 # --- COMMANDS ---
-
-@bot.event
-async def on_ready():
-    await load_data()
-    await bot.tree.sync()
-    print(f"{bot.user} has connected to Discord!")
 
 @bot.tree.command(name="pick", description="Make a pick in the draft")
 async def pick_command(interaction: discord.Interaction, player_name: str):
@@ -292,10 +350,18 @@ async def pick_command(interaction: discord.Interaction, player_name: str):
         await interaction.followup.send("❌ No picks remaining!")
         return
     
+    if interaction.channel_id != PICK_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"❌ Picks can only be made in <#{PICK_CHANNEL_ID}>.", 
+            ephemeral=True
+        )
+        return
+    
     current_team = draft_state["teams"][current_pick['team_id']]
     gm_user = draft_state["users"].get(current_team['gm_id'])
-    if gm_user and gm_user['username'] != str(interaction.user):
-        await interaction.followup.send("❌ This is not your pick!")
+    # Compare against the unique Snowflake ID for accuracy
+    if gm_user and str(gm_user['username']) != str(interaction.user.id):
+        await interaction.followup.send(f"❌ This is not your pick! It is currently {gm_user['screen_name']}'s turn.")
         return
     
     name_parts = player_name.strip().split()
@@ -321,7 +387,7 @@ async def pick_command(interaction: discord.Interaction, player_name: str):
 
 @bot.tree.command(name="start_draft", description="Admin Only: Officially start the draft and the Pick 1 clock")
 async def start_draft(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
 
@@ -332,7 +398,7 @@ async def start_draft(interaction: discord.Interaction):
         return
 
     # 1. Get Pick #1
-    first_pick = next((p for p in draft_state["picks"] if p['id'] == 1), None)
+    first_pick = next((p for p in draft_state["picks"] if int(p['id']) == 1), None)
     if not first_pick:
         await interaction.followup.send("❌ Error: Could not find Pick #1 in the data.")
         return
@@ -342,10 +408,10 @@ async def start_draft(interaction: discord.Interaction):
     
     # Update Google Sheets
     try:
-        gs = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
-        ws = gs.get_worksheet("picks")
+        
+        ws = gs_manager.get_worksheet("picks")
         cell = ws.find("1", in_column=1) # Find Pick ID 1
-        ws.update_cell(cell.row, 4, now_iso) # Column 4 is otc_at
+        ws.update_cell(cell.row, 3, now_iso) # Column 4 is otc_at
         
         # Update Local State
         draft_state["running"] = True
@@ -373,7 +439,7 @@ async def start_draft(interaction: discord.Interaction):
 
 @bot.tree.command(name="force", description="Force a pick (admins only)")
 async def force_command(interaction: discord.Interaction, player_name: str):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
     await interaction.response.defer()
@@ -421,7 +487,7 @@ async def trade_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="resume", description="Resume draft (admins only)")
 async def resume_command(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
     draft_state["timer_paused"], draft_state["trade_in_progress"] = False, False
@@ -434,15 +500,15 @@ async def resume_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="order", description="Show draft order")
 async def order_command(interaction: discord.Interaction):
-    current_pick = get_current_pick()
-    on_deck, in_hole = get_on_deck_and_in_hole()
+    await interaction.response.defer()
+    otc, on_deck, in_hole = get_on_deck_and_in_hole()
     embed = discord.Embed(title="📋 Draft Order", color=discord.Color.gold())
-    if current_pick:
-        team = draft_state["teams"][current_pick['team_id']]
+    if otc:
+        team = draft_state["teams"][otc['team_id']]
         gm = draft_state["users"].get(team['gm_id'])
         time_rem = get_time_remaining()
         h, m = time_rem.seconds // 3600, (time_rem.seconds % 3600) // 60
-        embed.add_field(name=f"Pick {current_pick['id']} - OTC", value=f"**{gm.get('screen_name', 'Unknown')}**\nTime: {h}h {m}m", inline=False)
+        embed.add_field(name=f"Pick {otc['id']} - OTC", value=f"**{gm.get('screen_name', 'Unknown')}**\nTime: {h}h {m}m", inline=False)
     if on_deck:
         team = draft_state["teams"][on_deck['team_id']]
         gm = draft_state["users"].get(team['gm_id'])
@@ -450,12 +516,32 @@ async def order_command(interaction: discord.Interaction):
     if in_hole:
         team = draft_state["teams"][in_hole['team_id']]
         gm = draft_state["users"].get(team['gm_id'])
-        embed.add_field(name=f"Pick {in_hole['id']} - In Hole", value=f"**{gm.get('screen_name', 'Unknown')}**", inline=False)
-    await interaction.response.send_message(embed=embed)
+        embed.add_field(name=f"Pick {in_hole['id']} - In The Hole", value=f"**{gm.get('screen_name', 'Unknown')}**", inline=False)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="best", description="Show top available")
-@app_commands.choices(position=[app_commands.Choice(name="QB", value="1"), app_commands.Choice(name="RB", value="2"), app_commands.Choice(name="WR", value="3"), app_commands.Choice(name="TE", value="4"), app_commands.Choice(name="OL", value="5"), app_commands.Choice(name="DL", value="9"), app_commands.Choice(name="LB", value="13"), app_commands.Choice(name="CB", value="14"), app_commands.Choice(name="S", value="15")])
-async def best_command(interaction: discord.Interaction, position: Optional[app_commands.Choice[int]] = None):
+@app_commands.choices(position=[
+    app_commands.Choice(name="QB", value=1), 
+    app_commands.Choice(name="RB", value=2), 
+    app_commands.Choice(name="WR", value=3), 
+    app_commands.Choice(name="TE", value=4), 
+    app_commands.Choice(name="OL", value=5),
+    app_commands.Choice(name="OT", value=6),
+    app_commands.Choice(name="OG", value=7),
+    app_commands.Choice(name="C", value=8), 
+    app_commands.Choice(name="DL", value=9),
+    app_commands.Choice(name="DE", value=10),
+    app_commands.Choice(name="DT", value=11),
+    app_commands.Choice(name="EDGE", value=12), 
+    app_commands.Choice(name="LB", value=13), 
+    app_commands.Choice(name="CB", value=14), 
+    app_commands.Choice(name="S", value=15), 
+    app_commands.Choice(name="K", value=16), 
+    app_commands.Choice(name="P", value=17), 
+    app_commands.Choice(name="LS", value=18), 
+    app_commands.Choice(name="IOL", value=19)])
+@app_commands.describe(private="If true, only you can see the response")
+async def best_command(interaction: discord.Interaction, position: Optional[app_commands.Choice[int]] = None, private: bool = True):
     undrafted = [p for p in draft_state["prospects"].values() if not p['drafted']]
     if position:
         undrafted = [p for p in undrafted if int(p['position_id']) == position.value]
@@ -470,22 +556,33 @@ async def best_command(interaction: discord.Interaction, position: Optional[app_
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="review", description="Review team picks")
-async def review_command(interaction: discord.Interaction, team_name: str):
-    team_id = next((tid for tid, t in draft_state["teams"].items() if team_name.lower() in str(tid).lower()), None)
-    if team_id is None:
-        await interaction.response.send_message("❌ Invalid team!")
+@app_commands.describe(acronym="2-3 Letter acronym of team (e.g. KC)")
+async def review_command(interaction: discord.Interaction, acronym: str):
+    await interaction.response.defer()
+
+    search_term = acronym.strip().upper()
+
+    team_data = next(
+        ((tid, t) for tid, t in draft_state["teams"].items() if t.get('team_short', '').upper() == search_term),(None, None))
+    team_id, team = team_data
+    if not team:
+        await interaction.followup.send("❌ Team acronym '**{search_term}**' not found. Please check your input and try again.")
         return
-    team = draft_state["teams"][team_id]
-    picks = [p for p in draft_state["picks"] if p['team_id'] == team_id and p['player_id']]
-    embed = discord.Embed(title=f"📊 {team['division']} Review", color=discord.Color.blue())
-    if picks:
-        for p in picks:
+        
+    team_picks = [p for p in draft_state["picks"] if str(p['team_id']) == str(team_id) and p.get('player_id')]
+
+    embed = discord.Embed(title=f"📊 {team['team_short']} Review", color=discord.Color.blue())
+    embed.set_footer(text=f"{team['conference']}  |  {team['division']}")
+
+    if team_picks:
+        for p in team_picks:
             prospect = draft_state["prospects"].get(p['player_id'])
-            pos = draft_state["positions"].get(prospect['position_id'], "N/A")
-            embed.add_field(name=f"Pick {p['id']}: {prospect['f_name']} {prospect['l_name']}", value=f"**{pos}** | {prospect['college']}", inline=False)
+            if prospect:
+                pos = draft_state["positions"].get(prospect['position_id'], "N/A")
+                embed.add_field(name=f"Pick {p['id']}: {prospect['f_name']} {prospect['l_name']}", value=f"**{pos}** | {prospect['college']}", inline=False)
     else:
         embed.add_field(name="Players", value="None drafted yet", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="trade_picks", description="Admin Only: Swap multiple picks between two teams")
 @app_commands.describe(
@@ -501,7 +598,7 @@ async def trade_picks(
     team_b_short: str, 
     team_b_picks: str
 ):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
 
@@ -533,13 +630,13 @@ async def trade_picks(
     # 3. Validation Helper
     def validate_ownership(pick_ids, expected_team_id):
         for pid in pick_ids:
-            pick = next((p for p in draft_state["picks"] if p['id'] == pid), None)
+            pick = next((p for p in draft_state["picks"] if str(p['id']) == str(pid)), None)
             if not pick:
                 return f"Pick {pid} does not exist."
             if str(pick['team_id']) != str(expected_team_id):
                 actual_team = draft_state["teams"].get(pick['team_id'], {}).get('team_short', 'UNK')
                 return f"Pick {pid} belongs to {actual_team}, not {expected_team_id}."
-            if pick['player_id'] is not None:
+            if pick['player_id'] not in [None, "", "None", 0, "0"]:
                 return f"Pick {pid} has already been used!"
         return None
 
@@ -551,20 +648,70 @@ async def trade_picks(
         return
 
     # 4. Execution
-    gs = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
-    ws = gs.get_worksheet("picks")
-    
-    def swap_ownership(pick_ids, new_team_id):
-        for pid in pick_ids:
-            # Update Local State
-            pick = next(p for p in draft_state["picks"] if p['id'] == pid)
-            pick['team_id'] = new_team_id
-            # Update Google Sheet
-            cell = ws.find(str(pid), in_column=1)
-            ws.update_cell(cell.row, 2, new_team_id)
+    ws = gs_manager.get_worksheet("picks")
+    cells_to_update = []
+    local_updates = []
+    otc_pick = get_current_pick()
+    now_iso = datetime.now(CENTRAL_TZ).isoformat()
 
-    swap_ownership(list_a, team_b_id)
-    swap_ownership(list_b, team_a_id)
+    # Helper to prepare updates without sending them yet
+    def prepare_trade_data(pick_ids, new_team_id):
+        for pid in pick_ids:
+            # 1. Find the row in the sheet
+            try:
+                cell = ws.find(str(pid), in_column=1)
+                # We want to update Column 2 (team_id) for this row
+                # We fetch the cell object for that specific coordinate
+                cells_to_update.append(Cell(row=cell.row, col=2, value=new_team_id))
+
+                # Reset Timer if this pick is currently OTC
+                if otc_pick and str(otc_pick['id']) == str(pid):
+                    cells_to_update.append(Cell(row=cell.row, col=3, value=now_iso))
+
+                    otc_pick['otc_at'] = now_iso  # Update local state for timer reset
+                    draft_state["warning_sent"] = None  # Reset warning flag since timer is effectively restarted
+                
+                # Store local state change for later
+                local_updates.append((pid, new_team_id))
+            except gspread.exceptions.CellNotFound:
+                print(f"Error: Pick ID {pid} not found in sheet.")
+
+    # Prepare both sides of the trade
+    prepare_trade_data(list_a, team_b_id)
+    prepare_trade_data(list_b, team_a_id)
+
+    if cells_to_update:
+        try:
+            # This is the optimization: One network request for all cells
+            ws.update_cells(cells_to_update)
+            draft_state["picks"] = gs_manager.load_picks()
+            print("Picks synced successfully after trade.")
+
+            current_pick = next((p for p in draft_state["picks"] if p.get('player_id') in [None, "", "None"]), None)
+
+            if current_pick:
+                # 2. Check if the current OTC pick was part of the trade
+                all_traded_picks = list_a + list_b
+                if int(current_pick['id']) in [int(p) for p in all_traded_picks]:
+                    # 3. If it was traded, trigger a "New Team is OTC" message
+                    new_team = draft_state["teams"].get(current_pick['team_id'])
+                    new_gm_id = new_team.get('gm_id') if new_team else None
+                    
+                    otc_embed = discord.Embed(
+                        title="⏱️ Order of Play Updated",
+                        description=f"Due to the trade, **<@{new_gm_id}>** is now **On the Clock** for Pick {current_pick['id']}!",
+                        color=discord.Color.blue()
+                    )
+                    
+                    if new_gm_id:
+                        # Mention the new GM so they get a notification
+                        await interaction.channel.send(content=f"🔔 <@{new_gm_id}>, you're up!", embed=otc_embed)
+                    else:
+                        await interaction.channel.send(embed=otc_embed)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ API Error: Could not sync to Sheets. {e}")
+            return
 
     # 5. Success Message
     embed = discord.Embed(title="🤝 Trade Executed!", color=discord.Color.gold())
@@ -576,14 +723,14 @@ async def trade_picks(
 @bot.tree.command(name="reverse_pick", description="Admin Only: Undo a specific pick and restart its clock")
 @app_commands.describe(pick_id="The number of the pick to undo")
 async def reverse_pick(interaction: discord.Interaction, pick_id: int):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
 
     await interaction.response.defer()
 
     # 1. Find the pick in state
-    pick = next((p for p in draft_state["picks"] if p['id'] == pick_id), None)
+    pick = next((p for p in draft_state["picks"] if str(p['id']) == str(pick_id)), None)
     
     if not pick:
         await interaction.followup.send(f"❌ Pick {pick_id} not found.")
@@ -599,20 +746,24 @@ async def reverse_pick(interaction: discord.Interaction, pick_id: int):
     team_short = draft_state["teams"].get(pick['team_id'], {}).get('team_short', 'UNK')
 
     # 3. Update Google Sheets
-    gs = GoogleSheetsManager(GOOGLE_SHEETS_CREDENTIALS, SHEET_ID)
+    
     
     # Reset the Pick Row
     now_iso = datetime.now(CENTRAL_TZ).isoformat()
-    p_ws = gs.get_worksheet("picks")
+    p_ws = gs_manager.get_worksheet("picks")
     p_cell = p_ws.find(str(pick_id), in_column=1)
-    p_ws.update_cell(p_cell.row, 3, "")       # Clear player_id
-    p_ws.update_cell(p_cell.row, 4, now_iso)  # Reset otc_at to NOW
+    p_ws.update_cell(p_cell.row, 4, "")       # Clear player_id
+    restart_time = datetime.now(CENTRAL_TZ).isoformat()
+    p_ws.update_cell(p_cell.row, 3, restart_time)
+    pick['otc_at'] = restart_time
+    # Also reset the warning flag so the 30-minute warning can trigger again
+    draft_state["warning_sent"] = None
     p_ws.update_cell(p_cell.row, 5, "")       # Clear picked_at
     
     # Reset the Prospect Row
-    pr_ws = gs.get_worksheet("prospects")
+    pr_ws = gs_manager.get_worksheet("prospects")
     pr_cell = pr_ws.find(str(player_id), in_column=1)
-    pr_ws.update_cell(pr_cell.row, 6, "FALSE") # drafted = FALSE
+    pr_ws.update_cell(pr_cell.row, 7, "FALSE") # drafted = FALSE
 
     # 4. Update Local State
     pick['player_id'] = None
@@ -642,16 +793,91 @@ async def great(interaction: discord.Interaction):
 
 @bot.tree.command(name="sync", description="Admin Only: Refresh all data from Google Sheets")
 async def sync_command(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USERS:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     try:
+        # Clear local cache and reload fresh from Sheets
+        draft_state["picks"].clear()
         await load_data()
+        # Reset the index to find the new current pick
+        draft_state["current_pick_index"] = 0
         await interaction.followup.send("✅ Data successfully synced from Google Sheets!")
     except Exception as e:
         await interaction.followup.send(f"❌ Sync failed: {e}")
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-bot.run(TOKEN)
+@bot.tree.command(name="draft-status", description="Admin Only: Check internal state for debugging")
+async def draft_status_command(interaction: discord.Interaction):
+    if interaction.user.id not in ADMIN_IDS:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+
+    # 1. Determine Operational Status
+    now = datetime.now(CENTRAL_TZ)
+    is_frozen = now.hour >= 22 or now.hour < 9
+    
+    if draft_state.get("timer_paused"):
+        status_text = "⏸️ **PAUSED** (Manual or Trade)"
+        status_color = discord.Color.orange()
+    elif not draft_state.get("running"):
+        status_text = "💤 **NOT STARTED**"
+        status_color = discord.Color.light_grey()
+    elif is_frozen:
+        status_text = "❄️ **FROZEN** (Overnight Break)"
+        status_color = discord.Color.blue()
+    else:
+        status_text = "🟢 **ACTIVE**"
+        status_color = discord.Color.green()
+
+    # 2. Get Current Pick Info
+    current_pick = get_current_pick()
+    time_rem = get_time_remaining()
+    
+    # Calculate hours and minutes for display
+    # (Using // 3600 and % 3600 // 60 from your logic)
+    h, m = time_rem.seconds // 3600, (time_rem.seconds % 3600) // 60
+    
+    # 3. Build the Embed
+    embed = discord.Embed(title="⚙️ System Status Report", color=status_color)
+    embed.add_field(name="Draft Status", value=status_text, inline=False)
+    
+    if current_pick:
+        team = draft_state["teams"].get(current_pick['team_id'], {})
+        gm = draft_state["users"].get(team.get('gm_id'), {})   
+        # Count picks that have a player_id assigned (meaning they are completed)
+        completed_picks = sum(1 for p in draft_state["picks"] if not is_empty(p.get('player_id')))
+        
+        # Count prospects where is_drafted is specifically True
+        drafted_prospects = sum(1 for pr in draft_state["prospects"].values() if pr.get('is_drafted') is True)
+
+        pick_val = (
+            f"**Current Pick:** #{current_pick['id']}\n"
+            f"**Team:** {team.get('team_short', 'UNK')} ({team.get('name', 'Unknown')})\n"
+            f"**Clock:** {h}h {m}m remaining\n"
+            f"**Picks Completed:** {completed_picks}\n"
+            f"**Prospects Drafted:** {drafted_prospects}"
+        )
+        embed.add_field(name="Current Pick Details", value=pick_val, inline=False)
+    else:
+        embed.add_field(name="Current Pick", value="None (Draft likely complete)", inline=False)
+
+    # 4. Data Integrity Info
+    sync_time = draft_state.get("last_sync", "Never")
+    data_counts = (
+        f"Teams: {len(draft_state['teams'])}\n"
+        f"Prospects: {len(draft_state['prospects'])}\n"
+        f"Picks: {len(draft_state['picks'])}"
+    )
+    embed.add_field(name="Data Counts", value=data_counts, inline=True)
+    embed.add_field(name="Last Sync", value=f"🕒 {sync_time} CT", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+if __name__ == "__main__":
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("Critical Error: DISCORD_TOKEN not found in environment")
