@@ -1,0 +1,5 @@
+discord.py
+gspread
+google-auth
+pytz
+python-dotenv

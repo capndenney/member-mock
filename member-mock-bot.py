@@ -21,6 +21,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 ADMIN_IDS = json.loads(os.getenv("ADMIN_USERS", "[]"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATUS_FILE = os.path.join(BASE_DIR, "draft_status.json")
 ALLOWED_CHANNELS = json.loads(os.getenv("ALLOWED_CHANNELS", "[]"))
 REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", 0))
 PICK_CHANNEL_ID = int(os.getenv("PICK_CHANNEL_ID", 0))
@@ -28,6 +30,26 @@ CENTRAL_TZ = pytz.timezone('America/Chicago')
 PICK_TIME_HOURS = 2
 
 # --- DATA MANAGEMENT ---
+
+def save_status():
+# Saves the current running/paused state to a local file.
+    with open(STATUS_FILE, "w") as f:
+        data = {
+            "running": draft_state["running"],
+            "timer_paused": draft_state["timer_paused"]
+        }
+        json.dump(data, f)
+
+def load_status():
+ # Loads the state back into the draft_state dictionary on startup.
+    try:
+        with open(STATUS_FILE, "r") as f:
+            data = json.load(f)
+            draft_state["running"] = data.get("running", False)
+            draft_state["timer_paused"] = data.get("timer_paused", False)
+    except FileNotFoundError:
+    # If the file doesn't exist yet, just keep the defaults
+        pass
 
 class GoogleSheetsManager:
     def __init__(self, credentials_file: str, sheet_id: str):
@@ -100,6 +122,26 @@ class GoogleSheetsManager:
         for row in ws.get_all_records():
             positions[row['id']] = row['position']
         return positions
+
+    def save_status():
+    # Saves the current running/paused state to a local file.
+        with open("draft_status.json", "w") as f:
+            data = {
+                "running": draft_state["running"],
+                "timer_paused": draft_state["timer_paused"]
+            }
+            json.dump(data, f)
+
+    def load_status():
+    # Loads the state back into the draft_state dictionary on startup.
+        try:
+            with open("draft_status.json", "r") as f:
+                data = json.load(f)
+                draft_state["running"] = data.get("running", False)
+                draft_state["timer_paused"] = data.get("timer_paused", False)
+        except FileNotFoundError:
+        # If the file doesn't exist yet, just keep the defaults
+            pass
     
     def update_prospect_drafted(self, prospect_id: int, status: bool = True):
         ws = self.get_worksheet("prospects")
@@ -170,6 +212,7 @@ async def draft_timer_check():
 # IMPORTANT: You must start the loop in on_ready
 @bot.event
 async def on_ready():
+    load_status()
     await load_data()
     await bot.tree.sync()
     if not draft_timer_check.is_running():
@@ -188,26 +231,6 @@ async def load_data():
         draft_state["last_sync"] = datetime.now(CENTRAL_TZ).strftime("%H:%M:%S")
     except Exception as e:
         print(f"Error loading data: {e}")
-
-def save_status():
-    # Saves the current running/paused state to a local file.
-    with open("draft_status.json", "w") as f:
-        data = {
-            "running": draft_state["running"],
-            "timer_paused": draft_state["timer_paused"]
-        }
-        json.dump(data, f)
-
-def load_status():
-    """Loads the state back into the draft_state dictionary on startup."""
-    try:
-        with open("draft_status.json", "r") as f:
-            data = json.load(f)
-            draft_state["running"] = data.get("running", False)
-            draft_state["timer_paused"] = data.get("timer_paused", False)
-    except FileNotFoundError:
-        # If the file doesn't exist yet, just keep the defaults
-        pass
 
 def find_prospect_by_name(first_name: str, last_name: str) -> Optional[int]:
     for pid, prospect in draft_state["prospects"].items():
@@ -252,7 +275,7 @@ def get_time_remaining() -> timedelta:
     deadline = start_time + timedelta(hours=PICK_TIME_HOURS)
 
     # 3. The "Overnight Jump"
-    # If the 2-hour window crosses the9PM barrier, push the deadline by 11 hours
+    # If the 2-hour window crosses the 10PM barrier, push the deadline by 11 hours
     # Example: Start 9:30 PM -> 2 hours later is 11:30 PM (crosses 10PM)
     # We add 11 hours to jump from 10PM to 9AM.
     if start_time.hour < 22 and deadline.hour >= 22 or (deadline.date() > start_time.date()):
@@ -286,6 +309,7 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
     prospect = draft_state["prospects"][prospect_id]
     team_info = draft_state["teams"].get(current_pick['team_id'])
     team_short_name = team_info.get('team_short', 'UNK')
+    ping_content = ""
     
     # Update Database
     
@@ -320,7 +344,10 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
         next_team = draft_state["teams"][otc['team_id']]
         next_gm = draft_state["users"].get(next_team['gm_id']) if next_team else None
         if next_gm:
-            message = f"🎙️ **On the Clock**: <@{next_gm.get('username', 'Unknown')}>\n"
+            user_id_val = next_gm.get('username', 'Unknown')
+            mention = f"<@{user_id_val}>"
+            ping_content = f"🔔 {mention}, you're up next for Pick {otc['id']}!"
+            message = f"🎙️ **On the Clock**: <@{next_gm.get('username', 'Unknown')}> ({next_gm.get('team_short', 'UNK')})\n"
             if on_deck:
                 deck_team = draft_state["teams"][on_deck['team_id']]
                 deck_gm = draft_state["users"].get(deck_team['gm_id'])
@@ -338,7 +365,7 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
     except Exception as e:
         print(f"Error refreshing data after pick: {e}") 
 
-    return embed
+    return embed, ping_content
 
 # --- COMMANDS ---
 
@@ -349,14 +376,7 @@ async def pick_command(interaction: discord.Interaction, player_name: str):
     if not current_pick:
         await interaction.followup.send("❌ No picks remaining!")
         return
-    
-    if interaction.channel_id != PICK_CHANNEL_ID:
-        await interaction.response.send_message(
-            f"❌ Picks can only be made in <#{PICK_CHANNEL_ID}>.", 
-            ephemeral=True
-        )
-        return
-    
+
     current_team = draft_state["teams"][current_pick['team_id']]
     gm_user = draft_state["users"].get(current_team['gm_id'])
     # Compare against the unique Snowflake ID for accuracy
@@ -375,6 +395,7 @@ async def pick_command(interaction: discord.Interaction, player_name: str):
     if not prospect_id:
         await notify_admins(interaction, f"⚠️ '{player_name}' not found. Timer paused.")
         draft_state["timer_paused"] = True
+        save_status()
         await interaction.followup.send("❌ Player not found! Admins notified.")
         return
 
@@ -382,8 +403,8 @@ async def pick_command(interaction: discord.Interaction, player_name: str):
         await interaction.followup.send("❌ Player already drafted!")
         return
 
-    result_embed = await process_pick_logic(current_pick, prospect_id)
-    await interaction.followup.send(embed=result_embed)
+    result_embed, ping_content = await process_pick_logic(current_pick, prospect_id)
+    await interaction.followup.send(content=ping_content if ping_content else None, embed=result_embed)
 
 @bot.tree.command(name="start_draft", description="Admin Only: Officially start the draft and the Pick 1 clock")
 async def start_draft(interaction: discord.Interaction):
@@ -415,6 +436,8 @@ async def start_draft(interaction: discord.Interaction):
         
         # Update Local State
         draft_state["running"] = True
+        draft_state["timer_paused"] = False
+        save_status()
         first_pick['otc_at'] = now_iso
         
         # 3. Identify the GM to ping
@@ -453,9 +476,12 @@ async def force_command(interaction: discord.Interaction, player_name: str):
     if not prospect_id:
         await interaction.followup.send(f"❌ Admin Error: Could not find '{player_name}'")
         return
-    result_embed = await process_pick_logic(current_pick, prospect_id)
+    result_embed, ping_content = await process_pick_logic(current_pick, prospect_id)
+    final_content = "⚠️ **ADMIN OVERRIDE**"
+    if ping_content:
+        final_content += f" | {ping_content}"
     result_embed.set_footer(text=f"Forced by Admin: {interaction.user.display_name}")
-    await interaction.followup.send("⚠️ **ADMIN OVERRIDE**", embed=result_embed)
+    await interaction.followup.send(content=final_content, embed=result_embed)
 
 @bot.tree.command(name="timer", description="Check time remaining")
 async def timer_command(interaction: discord.Interaction):
@@ -481,6 +507,7 @@ async def trade_command(interaction: discord.Interaction):
         await interaction.response.send_message("❌ No Active Pick!", ephemeral=True)
         return
     draft_state["timer_paused"] = True
+    save_status()
     draft_state["trade_in_progress"] = True
     await interaction.response.send_message("⏸️ Draft paused for trade. Notifying admins...")
     await notify_admins(interaction, f"🔄 Trade initiated by {interaction.user}")
@@ -490,7 +517,8 @@ async def resume_command(interaction: discord.Interaction):
     if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
-    draft_state["timer_paused"], draft_state["trade_in_progress"] = False, False
+    draft_state["timer_paused"], draft_state["trade_in_progress"], draft_state["running"] = False, False, True
+    save_status()
     current_pick = get_current_pick()
     if current_pick:
         gm = draft_state["users"].get(draft_state["teams"][current_pick['team_id']]['gm_id'])
@@ -553,7 +581,7 @@ async def best_command(interaction: discord.Interaction, position: Optional[app_
     for i, p in enumerate(top_10, 1):
         pos = draft_state["positions"].get(p['position_id'], "N/A")
         embed.add_field(name=f"{i}. {p['f_name']} {p['l_name']}", value=f"**{pos}** | {p['college']} | Rank: {p['ranking']}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=private)
 
 @bot.tree.command(name="review", description="Review team picks")
 @app_commands.describe(acronym="2-3 Letter acronym of team (e.g. KC)")
@@ -699,7 +727,7 @@ async def trade_picks(
                     
                     otc_embed = discord.Embed(
                         title="⏱️ Order of Play Updated",
-                        description=f"Due to the trade, **<@{new_gm_id}>** is now **On the Clock** for Pick {current_pick['id']}!",
+                        description=f"Due to the trade, **{new_team['team_short']}** is now **On the Clock** for Pick {current_pick['id']}!",
                         color=discord.Color.blue()
                     )
                     
