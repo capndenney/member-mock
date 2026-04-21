@@ -1,33 +1,33 @@
-import os
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-import json
-import gspread
-from gspread.cell import Cell
-from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
-import pytz
-from dotenv import load_dotenv
-from typing import Optional, List, Dict
+# import os
+# import discord
+# from discord.ext import commands, tasks
+# from discord import app_commands
+# import json
+# import gspread
+# from gspread.cell import Cell
+# from google.oauth2.service_account import Credentials
+# from datetime import datetime, timedelta
+# import pytz
+# from dotenv import load_dotenv
+# from typing import Optional, List, Dict
 
-# --- INITIALIZATION ---
-load_dotenv()
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# # --- INITIALIZATION ---
+# load_dotenv()
+# intents = discord.Intents.default()
+# intents.message_content = True
+# bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Configuration
-GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
-ADMIN_IDS = json.loads(os.getenv("ADMIN_USERS", "[]"))
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATUS_FILE = os.path.join(BASE_DIR, "draft_status.json")
-ALLOWED_CHANNELS = json.loads(os.getenv("ALLOWED_CHANNELS", "[]"))
-REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", 0))
-PICK_CHANNEL_ID = int(os.getenv("PICK_CHANNEL_ID", 0))
-CENTRAL_TZ = pytz.timezone('America/Chicago')
-PICK_TIME_HOURS = 2
+# # Configuration
+# GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
+# SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+# ADMIN_IDS = json.loads(os.getenv("ADMIN_USERS", "[]"))
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# STATUS_FILE = os.path.join(BASE_DIR, "draft_status.json")
+# ALLOWED_CHANNELS = json.loads(os.getenv("ALLOWED_CHANNELS", "[]"))
+# REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", 0))
+# PICK_CHANNEL_ID = int(os.getenv("PICK_CHANNEL_ID", 0))
+# CENTRAL_TZ = pytz.timezone('America/Chicago')
+# PICK_TIME_HOURS = 2
 
 # --- DATA MANAGEMENT ---
 
@@ -172,200 +172,200 @@ PICK_TIME_HOURS = 2
 #     "last_sync": "Never"
 # }
 
-@tasks.loop(minutes=5)
-async def draft_timer_check():
-    if not draft_state.get("running") or draft_state.get("timer_paused"):
-        return
+# @tasks.loop(minutes=5)
+# async def draft_timer_check():
+#     if not draft_state.get("running") or draft_state.get("timer_paused"):
+#         return
 
-    current_pick = get_current_pick()
-    if not current_pick:
-        return
+#     current_pick = get_current_pick()
+#     if not current_pick:
+#         return
 
-    # Check if we've already warned for THIS specific pick ID
-    if draft_state["warning_sent"] == current_pick['id']:
-        return
+#     # Check if we've already warned for THIS specific pick ID
+#     if draft_state["warning_sent"] == current_pick['id']:
+#         return
 
-    time_remaining = get_time_remaining()
-    channel_id = bot.get_channel(REMINDER_CHANNEL_ID)
+#     time_remaining = get_time_remaining()
+#     channel_id = bot.get_channel(REMINDER_CHANNEL_ID)
 
-    # If 30 minutes or less (but more than 0)
-    if timedelta(minutes=0) < time_remaining <= timedelta(minutes=30):
-        current_team = draft_state["teams"].get(current_pick['team_id'])
-        gm_user_info = draft_state["users"].get(current_team['gm_id'])
+#     # If 30 minutes or less (but more than 0)
+#     if timedelta(minutes=0) < time_remaining <= timedelta(minutes=30):
+#         current_team = draft_state["teams"].get(current_pick['team_id'])
+#         gm_user_info = draft_state["users"].get(current_team['gm_id'])
         
-        if channel_id and gm_user_info:
-            # We assume your 'username' in the sheet is the Discord User ID (int) 
-            # or a string we can fetch. Adjust fetch_user as needed.
-            try:
-                # Find the main draft channel (Replace with your Channel ID)
+#         if channel_id and gm_user_info:
+#             # We assume your 'username' in the sheet is the Discord User ID (int) 
+#             # or a string we can fetch. Adjust fetch_user as needed.
+#             try:
+#                 # Find the main draft channel (Replace with your Channel ID)
                 
-                mention = f"<@{gm_user_info['username']}>"
-                await channel_id.send(
-                    f"⚠️ {mention} — **{current_team['team_short']}** has less than **30 minutes** remaining on the clock!"
-                )
+#                 mention = f"<@{gm_user_info['username']}>"
+#                 await channel_id.send(
+#                     f"⚠️ {mention} — **{current_team['team_short']}** has less than **30 minutes** remaining on the clock!"
+#                 )
                 
-                # Mark as sent for this pick ID
-                draft_state["warning_sent"] = current_pick['id']
-            except Exception as e:
-                print(f"Error in timer loop: {e}")
+#                 # Mark as sent for this pick ID
+#                 draft_state["warning_sent"] = current_pick['id']
+#             except Exception as e:
+#                 print(f"Error in timer loop: {e}")
 
 # IMPORTANT: You must start the loop in on_ready
-@bot.event
-async def on_ready():
-    load_status()
-    await load_data()
-    await bot.tree.sync()
-    if not draft_timer_check.is_running():
-        draft_timer_check.start()
-    print(f"{bot.user} is online and the timer loop is active!")
+# @bot.event
+# async def on_ready():
+#     load_status()
+#     await load_data()
+#     await bot.tree.sync()
+#     if not draft_timer_check.is_running():
+#         draft_timer_check.start()
+#     print(f"{bot.user} is online and the timer loop is active!")
 
 # --- LOGIC HELPERS ---
 
-async def load_data():
-    try:
-        draft_state["teams"] = gs_manager.load_teams()
-        draft_state["users"] = gs_manager.load_users()
-        draft_state["prospects"] = gs_manager.load_prospects()
-        draft_state["picks"] = gs_manager.load_picks()
-        draft_state["positions"] = gs_manager.load_positions()
-        draft_state["last_sync"] = datetime.now(CENTRAL_TZ).strftime("%H:%M:%S")
-    except Exception as e:
-        print(f"Error loading data: {e}")
+# async def load_data():
+#     try:
+#         draft_state["teams"] = gs_manager.load_teams()
+#         draft_state["users"] = gs_manager.load_users()
+#         draft_state["prospects"] = gs_manager.load_prospects()
+#         draft_state["picks"] = gs_manager.load_picks()
+#         draft_state["positions"] = gs_manager.load_positions()
+#         draft_state["last_sync"] = datetime.now(CENTRAL_TZ).strftime("%H:%M:%S")
+#     except Exception as e:
+#         print(f"Error loading data: {e}")
 
-def find_prospect_by_name(first_name: str, last_name: str) -> Optional[int]:
-    for pid, prospect in draft_state["prospects"].items():
-        if (prospect['f_name'].strip().lower() == first_name.strip().lower() and 
-            prospect['l_name'].strip().lower() == last_name.strip().lower()):
-            return pid
-    return None
+# def find_prospect_by_name(first_name: str, last_name: str) -> Optional[int]:
+#     for pid, prospect in draft_state["prospects"].items():
+#         if (prospect['f_name'].strip().lower() == first_name.strip().lower() and 
+#             prospect['l_name'].strip().lower() == last_name.strip().lower()):
+#             return pid
+#     return None
 
-def is_empty(value):
-    if value is None: return True
-    s_val = str(value).strip().lower()
-    return s_val in ["", "none", "0", "false", "null", 0, None]
+# def is_empty(value):
+#     if value is None: return True
+#     s_val = str(value).strip().lower()
+#     return s_val in ["", "none", "0", "false", "null", 0, None]
 
-def get_current_pick() -> Optional[Dict]:
-    undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
-    return undrafted_picks[0] if undrafted_picks else None
+# def get_current_pick() -> Optional[Dict]:
+#     undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
+#     return undrafted_picks[0] if undrafted_picks else None
 
-def get_on_deck_and_in_hole() -> tuple:
-    undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
-    otc = undrafted_picks[0] if len(undrafted_picks) > 0 else None
-    on_deck = undrafted_picks[1] if len(undrafted_picks) > 1 else None
-    in_hole = undrafted_picks[2] if len(undrafted_picks) > 2 else None
-    return otc, on_deck, in_hole
+# def get_on_deck_and_in_hole() -> tuple:
+#     undrafted_picks = [p for p in draft_state["picks"] if is_empty(p['player_id'])]
+#     otc = undrafted_picks[0] if len(undrafted_picks) > 0 else None
+#     on_deck = undrafted_picks[1] if len(undrafted_picks) > 1 else None
+#     in_hole = undrafted_picks[2] if len(undrafted_picks) > 2 else None
+#     return otc, on_deck, in_hole
 
-def get_time_remaining() -> timedelta:
-    now = datetime.now(CENTRAL_TZ)
-    current_pick = get_current_pick()
-    if not current_pick or is_empty(current_pick.get('otc_at')):
-        return timedelta(hours=PICK_TIME_HOURS)
+# def get_time_remaining() -> timedelta:
+#     now = datetime.now(CENTRAL_TZ)
+#     current_pick = get_current_pick()
+#     if not current_pick or is_empty(current_pick.get('otc_at')):
+#         return timedelta(hours=PICK_TIME_HOURS)
 
-    otc_time = datetime.fromisoformat(current_pick['otc_at']).astimezone(CENTRAL_TZ)
+#     otc_time = datetime.fromisoformat(current_pick['otc_at']).astimezone(CENTRAL_TZ)
     
-# 1. Determine "Active" Start Time
-    # If pick was made during freeze (10PM-9AM), it effectively starts at 9AM
-    start_time = otc_time
-    if otc_time.hour >= 22:
-        start_time = (otc_time + timedelta(days=1)).replace(hour=9, minute=0, second=0)
-    elif otc_time.hour < 9:
-        start_time = otc_time.replace(hour=9, minute=0, second=0)
+# # 1. Determine "Active" Start Time
+#     # If pick was made during freeze (10PM-9AM), it effectively starts at 9AM
+#     start_time = otc_time
+#     if otc_time.hour >= 22:
+#         start_time = (otc_time + timedelta(days=1)).replace(hour=9, minute=0, second=0)
+#     elif otc_time.hour < 9:
+#         start_time = otc_time.replace(hour=9, minute=0, second=0)
 
-    # 2. Calculate Raw Deadline
-    deadline = start_time + timedelta(hours=PICK_TIME_HOURS)
+#     # 2. Calculate Raw Deadline
+#     deadline = start_time + timedelta(hours=PICK_TIME_HOURS)
 
-    # 3. The "Overnight Jump"
-    # If the 2-hour window crosses the 10PM barrier, push the deadline by 11 hours
-    # Example: Start 9:30 PM -> 2 hours later is 11:30 PM (crosses 10PM)
-    # We add 11 hours to jump from 10PM to 9AM.
-    if start_time.hour < 22 and deadline.hour >= 22 or (deadline.date() > start_time.date()):
-        deadline += timedelta(hours=11)
+#     # 3. The "Overnight Jump"
+#     # If the 2-hour window crosses the 10PM barrier, push the deadline by 11 hours
+#     # Example: Start 9:30 PM -> 2 hours later is 11:30 PM (crosses 10PM)
+#     # We add 11 hours to jump from 10PM to 9AM.
+#     if start_time.hour < 22 and deadline.hour >= 22 or (deadline.date() > start_time.date()):
+#         deadline += timedelta(hours=11)
 
-# 4. Calculate Remaining Time
-    # If currently in the freeze (10PM-9AM), we compare the deadline 
-    # against the 9AM start time so the timer stays "paused."
-    is_in_freeze = now.hour >= 22 or now.hour < 9
+# # 4. Calculate Remaining Time
+#     # If currently in the freeze (10PM-9AM), we compare the deadline 
+#     # against the 9AM start time so the timer stays "paused."
+#     is_in_freeze = now.hour >= 22 or now.hour < 9
     
-    if is_in_freeze:
-        # The clock isn't running, so time remaining is fixed at its 9AM value
-        remaining = deadline - start_time
-    else:
-        # The clock is running, so use the actual current time
-        remaining = deadline - now
-    return max(remaining, timedelta(0))
+#     if is_in_freeze:
+#         # The clock isn't running, so time remaining is fixed at its 9AM value
+#         remaining = deadline - start_time
+#     else:
+#         # The clock is running, so use the actual current time
+#         remaining = deadline - now
+#     return max(remaining, timedelta(0))
 
-async def notify_admins(interaction: discord.Interaction, message: str):
-    for admin_id in ADMIN_IDS:
-        try:
-            user = await bot.fetch_user(admin_id)
-            await user.send(message)
-        except Exception as e:
-            print(f"Error notifying admin {admin_id}: {e}")
+# async def notify_admins(interaction: discord.Interaction, message: str):
+#     for admin_id in ADMIN_IDS:
+#         try:
+#             user = await bot.fetch_user(admin_id)
+#             await user.send(message)
+#         except Exception as e:
+#             print(f"Error notifying admin {admin_id}: {e}")
 
 # --- SHARED PICK PROCESSING ENGINE ---
 
-async def process_pick_logic(current_pick: Dict, prospect_id: int):
-    """Refactored core engine used by both user /pick and admin /force."""
-    prospect = draft_state["prospects"][prospect_id]
-    team_info = draft_state["teams"].get(current_pick['team_id'])
-    team_short_name = team_info.get('team_short', 'UNK')
-    ping_content = ""
+# async def process_pick_logic(current_pick: Dict, prospect_id: int):
+#     """Refactored core engine used by both user /pick and admin /force."""
+#     prospect = draft_state["prospects"][prospect_id]
+#     team_info = draft_state["teams"].get(current_pick['team_id'])
+#     team_short_name = team_info.get('team_short', 'UNK')
+#     ping_content = ""
     
-    # Update Database
+#     # Update Database
     
-    now_iso = datetime.now(CENTRAL_TZ).isoformat()
-    current_pick['player_id'] = prospect_id
-    prospect['drafted'] = True
-    current_pick['picked_at'] = now_iso
-    draft_state["warning_sent"] = None
+#     now_iso = datetime.now(CENTRAL_TZ).isoformat()
+#     current_pick['player_id'] = prospect_id
+#     prospect['drafted'] = True
+#     current_pick['picked_at'] = now_iso
+#     draft_state["warning_sent"] = None
 
-    gs_manager.update_pick(current_pick['id'], prospect_id, now_iso)
-    gs_manager.update_prospect_drafted(prospect_id)
+#     gs_manager.update_pick(current_pick['id'], prospect_id, now_iso)
+#     gs_manager.update_prospect_drafted(prospect_id)
 
-    otc, on_deck, in_hole = get_on_deck_and_in_hole()
+#     otc, on_deck, in_hole = get_on_deck_and_in_hole()
 
-    if otc:
-        otc['otc_at'] = now_iso
-        ws = gs_manager.get_worksheet("picks")
-        next_pick_cell = ws.find(str(otc['id']), in_column=1)
-        ws.update_cell(next_pick_cell.row, 3, now_iso) # Update otc_at for the new pick
+#     if otc:
+#         otc['otc_at'] = now_iso
+#         ws = gs_manager.get_worksheet("picks")
+#         next_pick_cell = ws.find(str(otc['id']), in_column=1)
+#         ws.update_cell(next_pick_cell.row, 3, now_iso) # Update otc_at for the new pick
     
-    # Create Response
-    embed = discord.Embed(
-        title="🏈 Pick Made!",
-        description=f"**{team_short_name}** | Pick {current_pick['id']}: **{prospect['f_name']} {prospect['l_name']}**",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="College", value=prospect['college'], inline=True)
-    embed.add_field(name="Position", value=draft_state["positions"].get(prospect['position_id'], "N/A"), inline=True)
-    embed.add_field(name="Ranking", value=prospect['ranking'], inline=True)
+#     # Create Response
+#     embed = discord.Embed(
+#         title="🏈 Pick Made!",
+#         description=f"**{team_short_name}** | Pick {current_pick['id']}: **{prospect['f_name']} {prospect['l_name']}**",
+#         color=discord.Color.green()
+#     )
+#     embed.add_field(name="College", value=prospect['college'], inline=True)
+#     embed.add_field(name="Position", value=draft_state["positions"].get(prospect['position_id'], "N/A"), inline=True)
+#     embed.add_field(name="Ranking", value=prospect['ranking'], inline=True)
     
-    if otc:
-        next_team = draft_state["teams"][otc['team_id']]
-        next_gm = draft_state["users"].get(next_team['gm_id']) if next_team else None
-        if next_gm:
-            user_id_val = next_gm.get('username', 'Unknown')
-            mention = f"<@{user_id_val}>"
-            ping_content = f"🔔 {mention}, you're up next for Pick {otc['id']}!"
-            message = f"🎙️ **On the Clock**: <@{next_gm.get('username', 'Unknown')}> ({next_gm.get('team_short', 'UNK')})\n"
-            if on_deck:
-                deck_team = draft_state["teams"][on_deck['team_id']]
-                deck_gm = draft_state["users"].get(deck_team['gm_id'])
-                if deck_gm:
-                    message += f"📍 **On Deck**: <@{deck_gm.get('username', 'Unknown')}> ({deck_team.get('team_short', 'UNK')})\n"
-                    if in_hole:
-                        hole_team = draft_state["teams"][in_hole['team_id']]
-                        hole_gm = draft_state["users"].get(hole_team['gm_id'])
-                        message += f"🕳️ **In the Hole**: <@{hole_gm.get('username', 'Unknown')}> ({hole_team.get('team_short', 'UNK')})\n"
-            embed.add_field(name="Next", value=message, inline=False)
-    try: 
-        draft_state["picks"] = gs_manager.load_picks()  # Refresh picks to reflect changes
-        draft_state["prospects"] = gs_manager.load_prospects()  # Refresh prospects to reflect changes
-        print("Data refreshed after pick." )
-    except Exception as e:
-        print(f"Error refreshing data after pick: {e}") 
+#     if otc:
+#         next_team = draft_state["teams"][otc['team_id']]
+#         next_gm = draft_state["users"].get(next_team['gm_id']) if next_team else None
+#         if next_gm:
+#             user_id_val = next_gm.get('username', 'Unknown')
+#             mention = f"<@{user_id_val}>"
+#             ping_content = f"🔔 {mention}, you're up next for Pick {otc['id']}!"
+#             message = f"🎙️ **On the Clock**: <@{next_gm.get('username', 'Unknown')}> ({next_gm.get('team_short', 'UNK')})\n"
+#             if on_deck:
+#                 deck_team = draft_state["teams"][on_deck['team_id']]
+#                 deck_gm = draft_state["users"].get(deck_team['gm_id'])
+#                 if deck_gm:
+#                     message += f"📍 **On Deck**: <@{deck_gm.get('username', 'Unknown')}> ({deck_team.get('team_short', 'UNK')})\n"
+#                     if in_hole:
+#                         hole_team = draft_state["teams"][in_hole['team_id']]
+#                         hole_gm = draft_state["users"].get(hole_team['gm_id'])
+#                         message += f"🕳️ **In the Hole**: <@{hole_gm.get('username', 'Unknown')}> ({hole_team.get('team_short', 'UNK')})\n"
+#             embed.add_field(name="Next", value=message, inline=False)
+#     try: 
+#         draft_state["picks"] = gs_manager.load_picks()  # Refresh picks to reflect changes
+#         draft_state["prospects"] = gs_manager.load_prospects()  # Refresh prospects to reflect changes
+#         print("Data refreshed after pick." )
+#     except Exception as e:
+#         print(f"Error refreshing data after pick: {e}") 
 
-    return embed, ping_content
+#     return embed, ping_content
 
 # --- COMMANDS ---
 
@@ -903,9 +903,9 @@ async def process_pick_logic(current_pick: Dict, prospect_id: int):
 
 #     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-if __name__ == "__main__":
-    TOKEN = os.getenv("DISCORD_TOKEN")
-    if TOKEN:
-        bot.run(TOKEN)
-    else:
-        print("Critical Error: DISCORD_TOKEN not found in environment")
+# if __name__ == "__main__":
+#     TOKEN = os.getenv("DISCORD_TOKEN")
+#     if TOKEN:
+#         bot.run(TOKEN)
+#     else:
+#         print("Critical Error: DISCORD_TOKEN not found in environment")
